@@ -1,0 +1,90 @@
+# This will build any time we push to master, and also for PRs that target master.
+# It will also build any time a tag starting with 'v' is created.
+
+name: Build and release
+
+on:
+  push:
+    branches: [ master ]
+  create:
+    tags: [ v* ]
+  pull_request:
+    branches: [ master ]
+
+jobs:
+  build:
+
+    runs-on: ubuntu-latest
+
+    env:
+      CreateRelease: ${{ startsWith(github.ref, 'refs/tags/v') }}
+
+    steps:
+    - uses: actions/checkout@v2
+
+    # Step required by GitVersion.
+    # The actions/checkout@v2 action minimizes the work it performs, which is normally good,
+    # but because it avoids fetching anything other than the commit we want to build, GitVersion
+    # doesn't have the information it requires to determine the correct version.
+    # TODO: is this overkill? Does this end up fetching more than GitVersion needs?
+    - name: Fetch all history for all tags and branches
+      run: git fetch --prune --unshallow
+
+    - name: Setup .NET Core
+      uses: actions/setup-dotnet@v1
+      with:
+        dotnet-version: 3.1.101
+
+    - name: Setup GitVersion
+      # There appear to be two options for installing. There's this:
+      # uses: actions/setup-gitversion@v1.0.0
+      # with:
+      #  gitversion-version: 5.2.4
+      # However that doesn't seem to have a corresponding task for running
+      # the tool, so we use this instead, because it aligns with the following
+      # step that runs the tool
+      uses: gittools/actions/gitversion/setup@v0.9.2
+      with:
+          versionSpec: '5.2.x'
+
+    - name: Use GitVersion
+      uses: gittools/actions/gitversion/execute@v0.9.2
+      id: gitversion # step id used as reference for output values
+
+    - name: Install dependencies
+      working-directory: src
+      run: dotnet restore
+
+    - name: Build
+      working-directory: src
+      run: dotnet build --configuration Release --no-restore /p:Version=${{ steps.gitversion.outputs.semVer }}
+
+    - name: Test
+      working-directory: src
+      run: dotnet test --no-build --configuration Release /p:Version=${{ steps.gitversion.outputs.semVer }}
+
+    - name: Create NuGet packages
+      working-directory: src
+      run: dotnet pack --no-build --configuration Release --output packages /p:Version=${{ steps.gitversion.outputs.semVer }}
+
+    - name: Upload NuGet package artifact
+      uses: actions/upload-artifact@v1.0.0
+      with:
+        name: NuGet packages
+        path: src/packages
+
+    - name: Create GitHub Release
+      id: create_release
+      if: env.CreateRelease == 'true'
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ github.ref }}
+        release_name: Release ${{ github.ref }}
+        draft: false
+        prerelease: ${{ steps.gitversion.outputs.preReleaseTag != '' }}
+
+    - name: Publish NuGet Package
+      if: env.CreateRelease == 'true'
+      run: dotnet nuget push **/*.nupkg --api-key ${{ secrets.nuget_api_key }} --source https://api.nuget.org/v3/index.json
